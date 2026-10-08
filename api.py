@@ -13,42 +13,43 @@ app = Flask(__name__)
 # ============================================================
 
 EMS_API_SECRET = os.environ.get("EMS_API_SECRET")
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
+DISCORD_911_CHANNEL_ID = os.environ.get("DISCORD_911_CHANNEL_ID")
 
 if not EMS_API_SECRET:
     raise RuntimeError(
         "EMS_API_SECRET environment variable is missing."
     )
 
-if not DISCORD_WEBHOOK_URL:
+if not DISCORD_BOT_TOKEN:
     raise RuntimeError(
-        "DISCORD_WEBHOOK_URL environment variable is missing."
+        "DISCORD_BOT_TOKEN environment variable is missing."
+    )
+
+if not DISCORD_911_CHANNEL_ID:
+    raise RuntimeError(
+        "DISCORD_911_CHANNEL_ID environment variable is missing."
     )
 
 
+DISCORD_API = "https://discord.com/api/v10"
+
+
 # ============================================================
-# TEMPORARY STATE
+# TEMPORARY LIVE STATE
 # ============================================================
-#
-# This is only the live state.
-# Permanent call records will be moved to our database next.
-#
 
 ems_state = {
     "online": False,
     "activated_by": None,
     "activated_at": None,
-    "revision": 0,
+    "revision": 0
 }
 
 
-# Messages created by the webhook during the current API session.
-#
-# When !off is used, these Discord messages can be deleted.
-#
-# IMPORTANT:
-# Call HISTORY will eventually be stored separately in the database.
-active_discord_messages = []
+# Messages created by THIS 911 API.
+# We'll move this tracking into PostgreSQL later.
+active_911_messages = []
 
 
 # ============================================================
@@ -56,6 +57,7 @@ active_discord_messages = []
 # ============================================================
 
 def authorized_request():
+
     supplied_secret = request.headers.get(
         "X-EMS-Secret",
         ""
@@ -65,6 +67,7 @@ def authorized_request():
 
 
 def unauthorized_response():
+
     return jsonify({
         "ok": False,
         "error": "Unauthorized"
@@ -84,6 +87,7 @@ def iso_now():
 
 
 def clean_string(value, max_length):
+
     if not isinstance(value, str):
         return None
 
@@ -96,28 +100,43 @@ def clean_string(value, max_length):
 
 
 # ============================================================
-# DISCORD WEBHOOK
+# DISCORD
 # ============================================================
 
-def send_discord_message(payload, track=True):
-    """
-    Send a webhook message and request Discord to return
-    the created message.
+def discord_headers():
 
-    That gives us its message ID so it can later be deleted.
-    """
+    return {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+
+def send_discord_message(embed, track=True):
+
+    url = (
+        f"{DISCORD_API}/channels/"
+        f"{DISCORD_911_CHANNEL_ID}/messages"
+    )
+
+    payload = {
+        "embeds": [embed],
+
+        "allowed_mentions": {
+            "parse": []
+        }
+    }
 
     try:
+
         response = requests.post(
-            DISCORD_WEBHOOK_URL,
-            params={
-                "wait": "true"
-            },
+            url,
+            headers=discord_headers(),
             json=payload,
             timeout=15
         )
 
     except requests.RequestException as exc:
+
         print(
             "[DISCORD] Request failed:",
             exc
@@ -126,9 +145,10 @@ def send_discord_message(payload, track=True):
         return None
 
 
-    if response.status_code not in (200, 204):
+    if response.status_code != 200:
+
         print(
-            "[DISCORD] Webhook failed:",
+            "[DISCORD] Send failed:",
             response.status_code,
             response.text
         )
@@ -136,44 +156,47 @@ def send_discord_message(payload, track=True):
         return None
 
 
-    # wait=true should normally return the message object.
-    if response.status_code == 200:
+    try:
+        message = response.json()
 
-        try:
-            message = response.json()
-        except ValueError:
-            return None
+    except ValueError:
+        return None
 
 
-        message_id = message.get("id")
-
-        if message_id and track:
-            active_discord_messages.append(
-                str(message_id)
-            )
+    message_id = message.get("id")
 
 
-        return message
+    if message_id and track:
+
+        active_911_messages.append(
+            str(message_id)
+        )
 
 
-    return {}
+    return message
 
 
 def delete_discord_message(message_id):
-    """
-    Delete a message that was created by this webhook.
-    """
+
+    url = (
+        f"{DISCORD_API}/channels/"
+        f"{DISCORD_911_CHANNEL_ID}/messages/"
+        f"{message_id}"
+    )
+
 
     try:
+
         response = requests.delete(
-            f"{DISCORD_WEBHOOK_URL}/messages/{message_id}",
+            url,
+            headers=discord_headers(),
             timeout=15
         )
 
     except requests.RequestException as exc:
 
         print(
-            "[DISCORD] Could not delete message",
+            "[DISCORD] Delete failed:",
             message_id,
             exc
         )
@@ -181,8 +204,6 @@ def delete_discord_message(message_id):
         return False
 
 
-    # 204 = successfully deleted
-    # 404 = already gone
     if response.status_code in (204, 404):
         return True
 
@@ -197,30 +218,26 @@ def delete_discord_message(message_id):
     return False
 
 
-def clear_active_discord_messages():
-    """
-    Delete only messages created and tracked by this API.
+def clear_active_911_messages():
 
-    This does NOT purge unrelated messages from the channel.
-    """
+    global active_911_messages
 
-    global active_discord_messages
-
-    message_ids = list(active_discord_messages)
+    messages = list(active_911_messages)
 
     deleted = 0
     failed = 0
 
 
-    for message_id in message_ids:
+    for message_id in messages:
 
         if delete_discord_message(message_id):
             deleted += 1
+
         else:
             failed += 1
 
 
-    active_discord_messages = []
+    active_911_messages = []
 
 
     return deleted, failed
@@ -241,11 +258,11 @@ def home():
 
 
 # ============================================================
-# EMS STATUS
+# STATUS
 # ============================================================
 
 @app.route("/ems/status", methods=["GET"])
-def ems_status():
+def status():
 
     if not authorized_request():
         return unauthorized_response()
@@ -273,22 +290,22 @@ def ems_on():
     ) or {}
 
 
-    roblox_username = clean_string(
+    username = clean_string(
         data.get("roblox_username"),
         50
     )
 
-    roblox_display_name = clean_string(
+    display_name = clean_string(
         data.get("roblox_display_name"),
         50
     )
 
-    roblox_user_id = data.get(
+    user_id = data.get(
         "roblox_user_id"
     )
 
 
-    if not roblox_username:
+    if not username:
 
         return jsonify({
             "ok": False,
@@ -296,40 +313,17 @@ def ems_on():
         }), 400
 
 
-    # --------------------------------------------------------
-    # Update system state
-    # --------------------------------------------------------
+    # Clear previous offline message/session messages.
+    deleted, failed = clear_active_911_messages()
 
-    ems_state["online"] = True
-
-    ems_state["activated_by"] = {
-        "username": roblox_username,
-        "display_name": roblox_display_name,
-        "user_id": roblox_user_id
-    }
-
-    ems_state["activated_at"] = iso_now()
-
-    ems_state["revision"] += 1
-
-
-    # --------------------------------------------------------
-    # Remove previous tracked status/call messages
-    # --------------------------------------------------------
-
-    deleted, failed = clear_active_discord_messages()
-
-
-    # --------------------------------------------------------
-    # Discord embed
-    # --------------------------------------------------------
 
     embed = {
-        "title": "911 SYSTEM ONLINE",
+        "title": "🚑 911 SYSTEM ONLINE",
 
         "description": (
             "**Grey Sloan Ambulance Service Dispatch**\n\n"
-            "The in-game 911 system is now accepting calls."
+            "The in-game 911 system is now accepting "
+            "emergency calls."
         ),
 
         "color": 3447003,
@@ -337,12 +331,12 @@ def ems_on():
         "fields": [
             {
                 "name": "Activated By",
-                "value": roblox_username,
+                "value": username,
                 "inline": True
             },
             {
                 "name": "Status",
-                "value": "Accepting Calls",
+                "value": "🟢 Accepting Calls",
                 "inline": True
             }
         ],
@@ -350,26 +344,20 @@ def ems_on():
         "timestamp": iso_now(),
 
         "footer": {
-            "text": "Grey Sloan Ambulance Service • 911 Dispatch"
+            "text": (
+                "Grey Sloan Ambulance Service "
+                "• Emergency Dispatch"
+            )
         }
     }
 
 
-    discord_message = send_discord_message({
-        "embeds": [embed],
-
-        # Prevent user-controlled content from creating mentions.
-        "allowed_mentions": {
-            "parse": []
-        }
-    })
+    message = send_discord_message(
+        embed
+    )
 
 
-    if discord_message is None:
-
-        # Roll state back because Roblox should NOT think
-        # the system activated successfully.
-        ems_state["online"] = False
+    if message is None:
 
         return jsonify({
             "ok": False,
@@ -377,15 +365,27 @@ def ems_on():
         }), 502
 
 
+    ems_state["online"] = True
+
+    ems_state["activated_by"] = {
+        "username": username,
+        "display_name": display_name,
+        "user_id": user_id
+    }
+
+    ems_state["activated_at"] = iso_now()
+    ems_state["revision"] += 1
+
+
     print(
-        f"[EMS] ONLINE - Activated by {roblox_username}"
+        f"[911] ONLINE - Activated by {username}"
     )
 
 
     return jsonify({
         "ok": True,
         "online": True,
-        "activated_by": roblox_username,
+        "activated_by": username,
         "messages_deleted": deleted,
         "delete_failures": failed
     }), 200
@@ -407,13 +407,13 @@ def ems_off():
     ) or {}
 
 
-    roblox_username = clean_string(
+    username = clean_string(
         data.get("roblox_username"),
         50
     )
 
 
-    if not roblox_username:
+    if not username:
 
         return jsonify({
             "ok": False,
@@ -421,31 +421,17 @@ def ems_off():
         }), 400
 
 
-    # --------------------------------------------------------
-    # Mark system offline
-    # --------------------------------------------------------
+    # Delete online status + active call messages.
+    deleted, failed = clear_active_911_messages()
 
-    ems_state["online"] = False
-    ems_state["revision"] += 1
-
-
-    # --------------------------------------------------------
-    # Clear active 911 Discord messages
-    # --------------------------------------------------------
-
-    deleted, failed = clear_active_discord_messages()
-
-
-    # --------------------------------------------------------
-    # Send OFFLINE message
-    # --------------------------------------------------------
 
     embed = {
-        "title": "911 SYSTEM OFFLINE",
+        "title": "🚑 911 SYSTEM OFFLINE",
 
         "description": (
             "**Grey Sloan Ambulance Service Dispatch**\n\n"
-            "The in-game 911 system is currently not accepting calls."
+            "The in-game 911 system is currently "
+            "not accepting emergency calls."
         ),
 
         "color": 15158332,
@@ -453,12 +439,12 @@ def ems_off():
         "fields": [
             {
                 "name": "Deactivated By",
-                "value": roblox_username,
+                "value": username,
                 "inline": True
             },
             {
                 "name": "Status",
-                "value": "Not Accepting Calls",
+                "value": "🔴 Not Accepting Calls",
                 "inline": True
             }
         ],
@@ -466,25 +452,20 @@ def ems_off():
         "timestamp": iso_now(),
 
         "footer": {
-            "text": "Grey Sloan Ambulance Service • 911 Dispatch"
+            "text": (
+                "Grey Sloan Ambulance Service "
+                "• Emergency Dispatch"
+            )
         }
     }
 
 
-    # Track this too.
-    #
-    # When !on is used later, the offline message will be
-    # removed and replaced by the new online message.
-    discord_message = send_discord_message({
-        "embeds": [embed],
-
-        "allowed_mentions": {
-            "parse": []
-        }
-    })
+    message = send_discord_message(
+        embed
+    )
 
 
-    if discord_message is None:
+    if message is None:
 
         return jsonify({
             "ok": False,
@@ -492,15 +473,19 @@ def ems_off():
         }), 502
 
 
+    ems_state["online"] = False
+    ems_state["revision"] += 1
+
+
     print(
-        f"[EMS] OFFLINE - Deactivated by {roblox_username}"
+        f"[911] OFFLINE - Deactivated by {username}"
     )
 
 
     return jsonify({
         "ok": True,
         "online": False,
-        "deactivated_by": roblox_username,
+        "deactivated_by": username,
         "messages_deleted": deleted,
         "delete_failures": failed
     }), 200
@@ -522,16 +507,12 @@ def submit_911_call():
     ) or {}
 
 
-    # --------------------------------------------------------
-    # Validate data
-    # --------------------------------------------------------
-
-    roblox_username = clean_string(
+    username = clean_string(
         data.get("roblox_username"),
         50
     )
 
-    roblox_display_name = clean_string(
+    display_name = clean_string(
         data.get("roblox_display_name"),
         50
     )
@@ -546,20 +527,20 @@ def submit_911_call():
         500
     )
 
-    roblox_user_id = data.get(
+    user_id = data.get(
         "roblox_user_id"
     )
 
-    roblox_job_id = data.get(
+    job_id = data.get(
         "roblox_job_id"
     )
 
-    roblox_place_id = data.get(
+    place_id = data.get(
         "roblox_place_id"
     )
 
 
-    if not roblox_username:
+    if not username:
 
         return jsonify({
             "ok": False,
@@ -583,10 +564,6 @@ def submit_911_call():
         }), 400
 
 
-    # --------------------------------------------------------
-    # Check EMS status
-    # --------------------------------------------------------
-
     if not ems_state["online"]:
 
         return jsonify({
@@ -595,37 +572,24 @@ def submit_911_call():
         }), 409
 
 
-    # --------------------------------------------------------
-    # Temporary Call ID
-    # --------------------------------------------------------
-    #
-    # The permanent database version will give us a proper
-    # sequential call number.
-    #
-
+    # Temporary ID.
+    # PostgreSQL will give us permanent sequential IDs later.
     call_id = (
         "GSMH-"
         + utc_now().strftime("%Y%m%d-%H%M%S")
         + "-"
-        + str(roblox_user_id or "UNKNOWN")
+        + str(user_id or "UNKNOWN")
     )
 
 
-    # --------------------------------------------------------
-    # Discord Embed
-    # --------------------------------------------------------
+    if display_name and display_name != username:
 
-    caller_display = roblox_username
-
-    if (
-        roblox_display_name
-        and roblox_display_name != roblox_username
-    ):
-
-        caller_display = (
-            f"{roblox_display_name} "
-            f"(@{roblox_username})"
+        caller = (
+            f"{display_name} (@{username})"
         )
+
+    else:
+        caller = username
 
 
     embed = {
@@ -633,7 +597,7 @@ def submit_911_call():
 
         "description": (
             "A new emergency call has been received "
-            "through the in-game 911 system."
+            "from the in-game 911 system."
         ),
 
         "color": 15158332,
@@ -644,19 +608,16 @@ def submit_911_call():
                 "value": call_id,
                 "inline": False
             },
-
             {
                 "name": "Caller",
-                "value": caller_display,
+                "value": caller,
                 "inline": False
             },
-
             {
                 "name": "Location",
                 "value": location,
                 "inline": False
             },
-
             {
                 "name": "Reason for Call",
                 "value": reason,
@@ -667,25 +628,20 @@ def submit_911_call():
         "timestamp": iso_now(),
 
         "footer": {
-            "text": "Grey Sloan Ambulance Service • Emergency Dispatch"
+            "text": (
+                "Grey Sloan Ambulance Service "
+                "• Emergency Dispatch"
+            )
         }
     }
 
 
-    # --------------------------------------------------------
-    # Send to Discord
-    # --------------------------------------------------------
-
-    discord_message = send_discord_message({
-        "embeds": [embed],
-
-        "allowed_mentions": {
-            "parse": []
-        }
-    })
+    message = send_discord_message(
+        embed
+    )
 
 
-    if discord_message is None:
+    if message is None:
 
         return jsonify({
             "ok": False,
@@ -693,40 +649,29 @@ def submit_911_call():
         }), 502
 
 
-    discord_message_id = discord_message.get(
-        "id"
-    )
-
-
-    # --------------------------------------------------------
-    # Temporary logging
-    # --------------------------------------------------------
-
     print(
         "[911 CALL]",
         call_id,
-        "|",
-        roblox_username,
-        "|",
+        "| User:",
+        username,
+        "| Location:",
         location,
-        "|",
-        reason,
         "| Job:",
-        roblox_job_id,
+        job_id,
         "| Place:",
-        roblox_place_id
+        place_id
     )
 
 
     return jsonify({
         "ok": True,
         "call_id": call_id,
-        "discord_message_id": discord_message_id
+        "discord_message_id": message.get("id")
     }), 201
 
 
 # ============================================================
-# RUN LOCALLY
+# LOCAL RUN
 # ============================================================
 
 if __name__ == "__main__":
